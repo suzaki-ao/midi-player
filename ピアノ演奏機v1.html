@@ -1,0 +1,444 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Web MIDI Piano Player - 安定版</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/tone/14.8.49/Tone.js"></script>
+<script src="https://unpkg.com/@tonejs/midi@2.0.28/build/Midi.js"></script>
+<style>
+*{box-sizing:border-box}
+body{margin:0;padding:12px;background:#111;color:#fff;font-family:system-ui,sans-serif;text-align:center}
+h1{margin:4px 0 8px;font-size:22px}
+#status{margin:8px auto;padding:8px;border-radius:7px;background:#1d1d1d;color:#03dac6;font-weight:700;max-width:1000px}
+.panel{max-width:1000px;margin:8px auto;padding:12px;background:#1b1b1b;border:1px solid #333;border-radius:9px}
+.row{display:flex;gap:9px;justify-content:center;align-items:center;flex-wrap:wrap;margin:7px 0}
+button,input,select{font:inherit;background:#303030;color:#fff;border:1px solid #555;border-radius:5px;padding:7px 10px}
+button{cursor:pointer}
+button:disabled,input:disabled,select:disabled{opacity:.45;cursor:not-allowed}
+#volume{width:180px}
+#progress{width:min(760px,90vw);height:13px}
+#stage{max-width:1000px;height:470px;margin:auto;background:#070707;border:2px solid #333;border-radius:8px;overflow:hidden;display:flex;flex-direction:column}
+#canvas{width:100%;flex:1;display:block}
+#keyboard{height:110px;background:#000;position:relative;flex:none}
+.key{position:absolute;bottom:0;border-radius:0 0 3px 3px}
+.white{background:#fff;border:1px solid #aaa;z-index:1}.white.active{background:#bb86fc!important}
+.black{background:#202020;border:1px solid #000;z-index:2}.black.active{background:#03dac6!important}
+#log{max-width:1000px;height:125px;overflow:auto;text-align:left;white-space:pre-wrap;background:#090909;border:1px solid #333;border-radius:6px;padding:8px;font:12px Consolas,monospace;color:#ddd}
+.ok{color:#6ee7b7}.err{color:#ff7777}
+
+#stage{position:relative}
+.screenControls{max-width:1000px;margin:8px auto;display:flex;gap:8px;justify-content:center;flex-wrap:wrap}
+#fileOverlay{position:absolute;right:14px;top:12px;z-index:20;max-width:55%;padding:7px 11px;border-radius:6px;background:rgba(0,0,0,.72);border:1px solid rgba(255,255,255,.22);color:#fff;font:600 14px system-ui,sans-serif;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;display:none}
+#stage.recording #fileOverlay,#stage.fullscreenMode #fileOverlay{display:block}
+#stage.recording{box-shadow:0 0 0 2px #ff3b30 inset}
+#stage.recording:after{content:"● REC";position:absolute;left:14px;top:12px;z-index:20;padding:6px 9px;border-radius:6px;background:#b00020;color:#fff;font-weight:800}
+#stage:fullscreen{width:100vw;height:100vh;max-width:none;border:0;border-radius:0;background:#050505}
+#stage:fullscreen #canvas{flex:1}
+#stage:fullscreen #keyboard{height:20vh}
+#stage:fullscreen #fileOverlay{display:block}
+#stage:fullscreen .key{height:20vh}
+</style>
+</head>
+<body>
+<h1>🎹 Web MIDI Piano Player — 安定版</h1>
+<div id="status">MIDIファイルを選択してください</div>
+
+<div class="panel">
+  <div class="row">
+    <input id="file" type="file" accept=".mid,.midi">
+    <button id="init" type="button">🔊 ピアノを準備</button>
+    <button id="test" type="button" disabled>🎹 C4テスト</button>
+  </div>
+  <div class="row">
+    <button id="play" disabled>▶ 再生</button>
+    <button id="stop" disabled>⏹ 停止</button>
+    <label>音量 <span id="volText">80%</span></label>
+    <input id="volume" type="range" min="0" max="100" value="80">
+    <label>BPM <span id="bpmText">120</span></label>
+    <input id="bpm" type="range" min="30" max="240" value="120" disabled>
+    <label>転調</label>
+    <select id="transpose" disabled>
+      <option>-6</option><option>-5</option><option>-4</option><option>-3</option>
+      <option>-2</option><option>-1</option><option selected>0</option>
+      <option>1</option><option>2</option><option>3</option><option>4</option><option>5</option><option>6</option>
+    </select>
+  </div>
+  <div class="row">
+    <progress id="progress" max="100" value="0"></progress>
+    <span id="loadText">ピアノ未ロード</span>
+  </div>
+</div>
+
+<div class="screenControls">
+  <button id="fullscreen" type="button">⛶ 全画面</button>
+  <button id="record" type="button">⏺ 演奏録画</button>
+  <button id="stopRecord" type="button" disabled>⏹ 録画停止</button>
+</div>
+<div id="stage">
+  <canvas id="canvas"></canvas>
+  <div id="fileOverlay">ファイル名未選択</div>
+  <div id="keyboard"></div>
+</div>
+<div class="panel">
+  <div id="log"></div>
+</div>
+
+<script>
+"use strict";
+
+const $ = id => document.getElementById(id);
+const canvas = $("canvas");
+const ctx = canvas.getContext("2d");
+const keyboard = $("keyboard");
+const keyEls = {};
+const layout = {};
+
+let midiData = null;
+let midiFileName = "";
+let piano = null;
+let volumeNode = null;
+let audioReady = false;
+let playing = false;
+let raf = 0;
+let scheduled = [];
+let playStartedTransport = 0;
+let playScale = 1;
+let midiDurationScaled = 0;
+
+const SAMPLE_BASE = "https://tonejs.github.io/audio/salamander/";
+let mediaRecorder=null,recordChunks=[],recording=false,recordStream=null;
+const SAMPLE_URLS = {
+  "C4":"C4.mp3",
+  "D#4":"Ds4.mp3",
+  "F#4":"Fs4.mp3",
+  "A4":"A4.mp3",
+  "C5":"C5.mp3",
+  "D#5":"Ds5.mp3",
+  "F#5":"Fs5.mp3",
+  "A5":"A5.mp3"
+};
+
+function log(msg, error=false){
+  const t = new Date().toLocaleTimeString("ja-JP",{hour12:false});
+  $("log").innerHTML += `<div class="${error?'err':'ok'}">[${t}] ${escapeHtml(msg)}</div>`;
+  $("log").scrollTop = $("log").scrollHeight;
+}
+function escapeHtml(s){return String(s).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]))}
+function code(prefix, e){
+  let h=0, s=(e&&e.message)||String(e||"");
+  for(let i=0;i<s.length;i++) h=((h<<5)-h+s.charCodeAt(i))|0;
+  return prefix+"-"+Math.abs(h).toString(16).toUpperCase().padStart(8,"0");
+}
+function setStatus(s,err=false){$("status").textContent=s;$("status").style.color=err?"#ff7777":"#03dac6"}
+function progress(v,text){$("progress").value=v;$("loadText").textContent=text}
+
+
+function toggleFullscreen(){
+  const stage=$("stage");
+  if(!document.fullscreenElement){
+    stage.requestFullscreen?.().then(()=>{
+      stage.classList.add("fullscreenMode");
+      setStatus("⛶ 全画面表示中");
+      resize(); buildKeyboard();
+    }).catch(e=>log(code("FS",e)+": "+e.message,true));
+  }else{
+    document.exitFullscreen?.();
+  }
+}
+document.addEventListener("fullscreenchange",()=>{
+  const on=!!document.fullscreenElement;
+  $("stage").classList.toggle("fullscreenMode",on);
+  $("fullscreen").textContent=on?"↙ 全画面終了":"⛶ 全画面";
+  setTimeout(()=>{resize();buildKeyboard()},80);
+});
+
+function startRecording(){
+  if(!audioReady || !piano || !recordStream){
+    log("REC-00000001: 先に「ピアノを準備」を押してください",true);
+    return;
+  }
+  if(!midiData){
+    log("REC-00000002: MIDIファイルを選択してください",true);
+    return;
+  }
+  if(!window.MediaRecorder){
+    log("REC-00000003: このブラウザはMediaRecorderに対応していません",true);
+    return;
+  }
+  try{
+    recordChunks=[];
+    const mimeTypes=[
+      "audio/webm;codecs=opus",
+      "audio/webm"
+    ];
+    const mime=mimeTypes.find(x=>MediaRecorder.isTypeSupported(x))||"";
+    mediaRecorder=new MediaRecorder(recordStream.stream,mime?{mimeType:mime}:undefined);
+    mediaRecorder.ondataavailable=e=>{if(e.data&&e.data.size)recordChunks.push(e.data)};
+    mediaRecorder.onstop=()=>{
+      const blob=new Blob(recordChunks,{type:mediaRecorder.mimeType||"audio/webm"});
+      const a=document.createElement("a");
+      a.href=URL.createObjectURL(blob);
+      const base=(midiFileName||"piano_performance").replace(/\.[^.]+$/,"");
+      a.download=base+"_演奏録音.webm";
+      a.click();
+      setTimeout(()=>URL.revokeObjectURL(a.href),1000);
+      log("REC-OK: 演奏音声を保存しました");
+    };
+    mediaRecorder.start(100);
+    recording=true;
+    $("stage").classList.add("recording");
+    $("record").disabled=true;
+    $("stopRecord").disabled=false;
+    log("REC-START: 録音開始 / ファイル名="+(midiFileName||""));
+    setStatus("🔴 演奏録画中 — 右上にファイル名を表示");
+  }catch(e){
+    const c=code("REC",e);log(c+": "+(e.stack||e.message||e),true);
+  }
+}
+function stopRecording(){
+  if(!mediaRecorder||mediaRecorder.state==="inactive")return;
+  mediaRecorder.stop();
+  recording=false;
+  $("stage").classList.remove("recording");
+  $("record").disabled=false;
+  $("stopRecord").disabled=true;
+  setStatus("⏹ 録音を停止しました");
+}
+$("fullscreen").addEventListener("click",toggleFullscreen);
+$("record").addEventListener("click",startRecording);
+$("stopRecord").addEventListener("click",stopRecording);
+
+function resize(){
+  canvas.width=canvas.clientWidth;
+  canvas.height=canvas.clientHeight;
+}
+window.addEventListener("resize",()=>{resize();buildKeyboard()});
+
+function buildKeyboard(){
+  keyboard.innerHTML="";
+  for(const k in keyEls) delete keyEls[k];
+  for(const k in layout) delete layout[k];
+  let whites=0;
+  for(let m=21;m<=108;m++) if(!Tone.Frequency(m,"midi").toNote().includes("#")) whites++;
+  const ww=keyboard.clientWidth/whites, bw=ww*.64;
+  let wi=0;
+  for(let m=21;m<=108;m++){
+    const note=Tone.Frequency(m,"midi").toNote();
+    const black=note.includes("#");
+    const el=document.createElement("div");
+    el.className="key "+(black?"black":"white");
+    let x,w;
+    if(!black){x=wi*ww;w=ww;el.style.width=w+"px";el.style.height="110px";el.style.left=x+"px";wi++}
+    else{x=wi*ww-bw/2;w=bw;el.style.width=w+"px";el.style.height="70px";el.style.left=x+"px"}
+    keyboard.appendChild(el);keyEls[m]=el;layout[m]={x,w,black};
+  }
+}
+
+function midiNote(m){return Tone.Frequency(m,"midi").toNote()}
+
+async function preparePiano(){
+  if(audioReady && piano){
+    if(Tone.getContext().state!=="running") await Tone.start();
+    setStatus("🎹 ピアノ準備完了");
+    return true;
+  }
+  try{
+    setStatus("🔊 AudioContextを起動中...");
+    log("AUDIO-001: Tone.start()開始");
+    await Tone.start();
+    if(Tone.getContext().state!=="running") throw new Error("AudioContextがrunningになりません: "+Tone.getContext().state);
+
+    progress(10,"AudioContext: running");
+
+    volumeNode = new Tone.Gain(Number($("volume").value)/100);
+    // 録画用のWeb Audio出力を作成。スピーカーと録画の両方へ同じ音を送る。
+    recordStream = Tone.getContext().createMediaStreamDestination();
+    volumeNode.connect(recordStream);
+    volumeNode.toDestination();
+
+    log("AUDIO-002: Tone.js AudioContext = "+Tone.getContext().state);
+    setStatus("🎹 ピアノサンプルを読み込み中...");
+    progress(20,"Salamander Grand Pianoをロード中...");
+
+    piano = new Tone.Sampler({
+      urls:SAMPLE_URLS,
+      baseUrl:SAMPLE_BASE,
+      release:1.2,
+      attack:0,
+      onload:()=>{
+        log("PIANO-READY: 8基準音の読み込み完了");
+      }
+    }).connect(volumeNode);
+
+    await Tone.loaded();
+    if(!piano.loaded) throw new Error("Tone.Sampler.loaded が false のままです");
+
+    audioReady=true;
+    progress(100,"ピアノ読み込み完了");
+    $("test").disabled=false;
+    setStatus("🎹 ピアノ準備完了 — C4テストを押してください");
+    log("AUDIO-READY: Sampler loaded=true / Destination接続済み");
+    return true;
+  }catch(e){
+    const c=code("AUD",e);
+    log(c+": "+(e.stack||e.message||e),true);
+    setStatus("❌ 音声初期化失敗 ["+c+"]",true);
+    progress(0,"失敗");
+    piano=null;volumeNode=null;audioReady=false;
+    return false;
+  }
+}
+
+$("init").addEventListener("click",preparePiano);
+
+$("test").addEventListener("click",async()=>{
+  try{
+    if(!(await preparePiano())) return;
+    await Tone.start();
+    const t=Tone.now()+0.05;
+    piano.triggerAttackRelease("C4",1.5,t,0.95);
+    log("TEST-OK: C4 をAudioContext時刻 "+t.toFixed(3)+" に発音予約");
+    setStatus("🔊 C4を発音しました");
+    flashKey(60,1500);
+  }catch(e){
+    const c=code("PLY",e);log(c+": "+(e.stack||e.message||e),true);setStatus("❌ 発音失敗 ["+c+"]",true);
+  }
+});
+
+$("volume").addEventListener("input",()=>{
+  const v=Number($("volume").value);
+  $("volText").textContent=v+"%";
+  if(volumeNode) volumeNode.gain.rampTo(v/100,0.03);
+});
+$("bpm").addEventListener("input",()=>{
+  $("bpmText").textContent=$("bpm").value;
+});
+$("transpose").addEventListener("change",()=>{if(playing){stopPlayback();startPlayback()}});
+
+$("file").addEventListener("change",async e=>{
+  const file=e.target.files[0]; if(!file)return;
+  midiFileName=file.name;
+  $("fileOverlay").textContent=file.name;
+  try{
+    progress(5,"MIDIファイル読み込み中...");
+    const buf=await file.arrayBuffer();
+    midiData=new Midi(buf);
+    if(!midiData.tracks?.length || midiData.duration<=0) throw new Error("有効なMIDIノートがありません");
+    const bpm0=midiData.header.tempos[0]?.bpm||120;
+    $("bpm").value=Math.max(30,Math.min(240,Math.round(bpm0)));
+    $("bpmText").textContent=$("bpm").value;
+    $("bpm").disabled=false;$("transpose").disabled=false;$("play").disabled=false;$("stop").disabled=false;
+    progress(100,`${midiData.tracks.length}トラック / ${countNotes()}ノート / ${midiData.duration.toFixed(2)}秒`);
+    setStatus(`🎵 ${file.name} 読み込み完了`);
+    log(`MIDI-READY: ${file.name} / ${countNotes()} notes / ${midiData.duration.toFixed(2)}s`);
+    // MIDI選択だけでは音源を自動ロードしない。ボタンでユーザー操作として確実に開始。
+  }catch(e){
+    midiData=null;
+    const c=code("MID",e);log(c+": "+(e.stack||e.message||e),true);setStatus("❌ MIDI解析失敗 ["+c+"]",true);
+  }
+});
+
+function countNotes(){
+  return midiData?midiData.tracks.reduce((n,t)=>n+t.notes.length,0):0;
+}
+
+function stopPlayback(){
+  playing=false;
+  Tone.Transport.stop();
+  Tone.Transport.cancel(0);
+  scheduled.length=0;
+  if(raf) cancelAnimationFrame(raf);
+  raf=0;
+  document.querySelectorAll(".key").forEach(k=>k.classList.remove("active"));
+  ctx.clearRect(0,0,canvas.width,canvas.height);
+  setStatus(midiData?"⏹ 停止しました":"MIDIファイルを選択してください");
+}
+
+$("stop").addEventListener("click",stopPlayback);
+$("play").addEventListener("click",startPlayback);
+
+async function startPlayback(){
+  if(!midiData)return;
+  if(!(await preparePiano()))return;
+  try{
+    stopPlayback();
+    await Tone.start();
+
+    const transpose=Number($("transpose").value);
+    const sourceBpm=midiData.header.tempos[0]?.bpm||120;
+    const targetBpm=Number($("bpm").value);
+    playScale=sourceBpm/targetBpm;
+    midiDurationScaled=midiData.duration*playScale;
+
+    Tone.Transport.bpm.value=targetBpm;
+    const startAt=Tone.now()+0.15;
+    playStartedTransport=startAt;
+
+    // Tone.Transportは正確なAudioContext時刻をcallbackへ渡すため、
+    // そのtimeをSamplerへそのまま渡す。
+    midiData.tracks.forEach(track=>{
+      track.notes.forEach(note=>{
+        const m=note.midi+transpose;
+        if(m<21||m>108)return;
+        const when=note.time*playScale;
+        const dur=Math.max(0.015,note.duration*playScale);
+        const id=Tone.Transport.scheduleOnce(time=>{
+          if(!playing)return;
+          piano.triggerAttackRelease(midiNote(m),dur,time,Math.max(.02,Math.min(1,note.velocity||.8)));
+          Tone.Draw.schedule(()=>flashKey(m,dur*1000),time);
+        },when);
+        scheduled.push(id);
+      });
+    });
+
+    const endId=Tone.Transport.scheduleOnce(()=>{
+      stopPlayback();
+    },midiDurationScaled+0.3);
+    scheduled.push(endId);
+
+    // Transportの0秒から開始。音声側と描画側を同じTransport時計で管理。
+    Tone.Transport.position=0;
+    playing=true;
+    Tone.Transport.start(startAt);
+    setStatus(`▶ 再生中 — ${countNotes()}ノート`);
+    log(`PLAY-OK: start=${startAt.toFixed(3)} / BPM=${targetBpm} / scale=${playScale.toFixed(4)}`);
+    draw();
+  }catch(e){
+    const c=code("PLY",e);log(c+": "+(e.stack||e.message||e),true);setStatus("❌ 再生失敗 ["+c+"]",true);playing=false;
+  }
+}
+
+function flashKey(m,ms){
+  const el=keyEls[m]; if(!el)return;
+  el.classList.add("active");
+  setTimeout(()=>el.classList.remove("active"),Math.max(60,ms));
+}
+
+function draw(){
+  if(!playing)return;
+  ctx.clearRect(0,0,canvas.width,canvas.height);
+  const now=Tone.Transport.seconds;
+  const windowSec=3.0;
+  const transpose=Number($("transpose").value);
+  midiData.tracks.forEach(track=>track.notes.forEach(note=>{
+    const m=note.midi+transpose;
+    if(m<21||m>108)return;
+    const s=note.time*playScale, e=(note.time+note.duration)*playScale;
+    if(e<now || s>now+windowSec)return;
+    const k=layout[m]; if(!k)return;
+    const y1=canvas.height-((s-now)/windowSec)*canvas.height;
+    const y2=canvas.height-((e-now)/windowSec)*canvas.height;
+    const h=Math.max(4,y1-y2);
+    ctx.fillStyle=k.black?"#03dac6":"#bb86fc";
+    ctx.fillRect(k.x+1,y2,k.w-2,h);
+  }));
+  raf=requestAnimationFrame(draw);
+}
+
+resize();buildKeyboard();
+log("SYSTEM-READY: Tone.js + Tone.Sampler / Salamander Grand Piano");
+log("操作: ①「ピアノを準備」→ ②「C4テスト」→ ③ MIDI選択 → ④「再生」");
+</script>
+</body>
+</html>
